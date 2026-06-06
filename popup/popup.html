@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Block Website</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <div class="header-row">
+      <h1>Block Website</h1>
+      <p id="status-badge" class="badge idle">Not blocking</p>
+    </div>
+    <p id="unblock-countdown" class="countdown" hidden></p>
+  </header>
+
+  <section>
+    <h2>Blocked patterns</h2>
+    <p class="hint">Use <code>*</code> as a wildcard per segment, e.g. <code>*.google.*</code></p>
+    <div class="pattern-row">
+      <input id="pattern-input" type="text" placeholder="*.google.*" />
+      <button id="add-pattern" type="button">Add</button>
+    </div>
+    <ul id="pattern-list"></ul>
+  </section>
+
+  <section id="setup-section">
+    <h2>Emergency access</h2>
+    <p class="hint">Allowed access per day (cumulative), set before blocking starts. Use <code>MM:SS</code> or decimal minutes.</p>
+    <label class="field">
+      <span>Time per day</span>
+      <input id="emergency-minutes" type="text" placeholder="15:00 or 15.5" value="15:00" spellcheck="false" />
+    </label>
+    <p id="emergency-remaining" class="subtle"></p>
+  </section>
+
+  <section id="schedule-section">
+    <h2>Auto-stop schedule</h2>
+    <label class="field">
+      <span>Stop blocking at</span>
+      <input id="block-end" type="datetime-local" />
+    </label>
+  </section>
+
+  <footer>
+    <button id="start-btn" type="button" class="primary">Start blocking</button>
+    <p id="block-until" class="subtle"></p>
+    <p id="error" class="error" hidden></p>
+  </footer>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
