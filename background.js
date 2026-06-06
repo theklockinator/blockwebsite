@@ -1,7 +1,8 @@
 import {
   extractHostname,
-  hostnameMatchesAnyPattern,
+  normalizeTargetUrl,
   patternToUrlRegex,
+  urlMatchesAnyPattern,
 } from "./lib/patterns.js";
 import {
   getEmergencyRemainingMs,
@@ -10,8 +11,7 @@ import {
   saveSettings,
 } from "./lib/storage.js";
 
-const BLOCK_RULE_BASE = 1000;
-const ALLOW_RULE_BASE = 2000;
+const OVERLAY_SCRIPT_ID = "blockwebsite-overlay";
 const BLOCKING_TICK_ALARM = "blocking-tick";
 const BLOCK_END_ALARM = "block-end";
 
@@ -20,139 +20,118 @@ const activeEmergencyTabs = new Map();
 
 let syncPaused = false;
 let syncPromise = null;
-/** @type {Promise<void>} */
-let dnrChain = Promise.resolve();
-
-function withDnrLock(task) {
-  const run = dnrChain.then(task);
-  dnrChain = run.catch(() => {});
-  return run;
-}
-
-async function getBlockRuleIds() {
-  const rules = await chrome.declarativeNetRequest.getDynamicRules();
-  return rules
-    .filter((r) => r.id >= BLOCK_RULE_BASE && r.id < ALLOW_RULE_BASE)
-    .map((r) => r.id);
-}
-
-async function updateDynamicRulesLocked(options) {
-  return withDnrLock(() => chrome.declarativeNetRequest.updateDynamicRules(options));
-}
-
-async function removeBlockRules() {
-  await withDnrLock(async () => {
-    const blockIds = await getBlockRuleIds();
-    if (blockIds.length) {
-      await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: blockIds });
-    }
-  });
-}
-
-async function clearAllDynamicRules() {
-  await withDnrLock(async () => {
-    const rules = await chrome.declarativeNetRequest.getDynamicRules();
-    const ids = rules.map((r) => r.id);
-    if (ids.length) {
-      await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: ids });
-    }
-  });
-}
-
-function buildBlockRules(settings) {
-  const blockedPageUrl = chrome.runtime.getURL("blocked/blocked.html");
-  return settings.patterns
-    .map((pattern, index) => {
-      const regexFilter = patternToUrlRegex(pattern);
-      if (!regexFilter) return null;
-      return {
-        id: BLOCK_RULE_BASE + index,
-        priority: 1,
-        action: {
-          type: "redirect",
-          redirect: {
-            regexSubstitution: `${blockedPageUrl}?url=\\1&pattern=${encodeURIComponent(pattern)}`,
-          },
-        },
-        condition: {
-          regexFilter,
-          resourceTypes: ["main_frame"],
-        },
-      };
-    })
-    .filter(Boolean);
-}
-
-async function replaceBlockRules(settings) {
-  const rules = buildBlockRules(settings);
-  if (!rules.length) {
-    throw new Error("No valid block rules could be created.");
-  }
-
-  await withDnrLock(async () => {
-    const removeRuleIds = await getBlockRuleIds();
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds, addRules: rules });
-  });
-}
-
-async function updateBlockRules(settings) {
-  if (settings.blockingActive) {
-    if (!settings.blockEndTime) {
-      await stopBlocking();
-      return;
-    }
-    const end = parseBlockEndMs(settings.blockEndTime);
-    if (!Number.isFinite(end) || end <= Date.now()) {
-      await stopBlocking();
-      return;
-    }
-  }
-
-  if (!settings.blockingActive || !settings.patterns.length) {
-    await removeBlockRules();
-    return;
-  }
-
-  try {
-    await replaceBlockRules(settings);
-  } catch (err) {
-    console.error("Failed to install block rules:", err);
-    await stopBlocking();
-    throw err;
-  }
-}
-
-function hostToUrlRegex(host) {
-  const escaped = host.replace(/\./g, "\\.");
-  return `^https?://(?:[^@/]+@)?(?:[^/:?#]+\\.)*${escaped}(/|$|\\?)`;
-}
-
-async function addAllowRule(host, ruleId) {
-  await updateDynamicRulesLocked({
-    addRules: [
-      {
-        id: ruleId,
-        priority: 10,
-        action: { type: "allow" },
-        condition: {
-          regexFilter: hostToUrlRegex(host),
-          resourceTypes: ["main_frame"],
-        },
-      },
-    ],
-  });
-}
-
-async function removeAllowRule(ruleId) {
-  try {
-    await updateDynamicRulesLocked({ removeRuleIds: [ruleId] });
-  } catch {
-    // Rule may already be gone.
-  }
-}
 
 function parseBlockEndMs(blockEndTime) {
   return new Date(blockEndTime).getTime();
+}
+
+function isInjectableUrl(url) {
+  return typeof url === "string" && /^https?:\/\//i.test(url);
+}
+
+async function getOverlayState(url, tabId, expired = false) {
+  const settings = await ensureBlockingNotExpired();
+  const normalizedUrl = normalizeTargetUrl(url);
+
+  const base = {
+    show: false,
+    emergencyRemainingMs: getEmergencyRemainingMs(settings),
+    blockEndTime: settings.blockEndTime,
+    expired,
+  };
+
+  if (!settings.blockingActive || !normalizedUrl) return base;
+  if (activeEmergencyTabs.has(tabId)) return base;
+  if (!urlMatchesAnyPattern(normalizedUrl, settings.patterns)) return base;
+
+  return { ...base, show: true };
+}
+
+async function registerOverlayScript() {
+  try {
+    await chrome.scripting.unregisterContentScripts({ ids: [OVERLAY_SCRIPT_ID] });
+  } catch {
+    // Not registered yet.
+  }
+
+  await chrome.scripting.registerContentScripts([
+    {
+      id: OVERLAY_SCRIPT_ID,
+      matches: ["http://*/*", "https://*/*"],
+      js: ["content/overlay.js"],
+      css: ["content/overlay.css"],
+      runAt: "document_idle",
+    },
+  ]);
+}
+
+async function unregisterOverlayScript() {
+  try {
+    await chrome.scripting.unregisterContentScripts({ ids: [OVERLAY_SCRIPT_ID] });
+  } catch {
+    // Already unregistered.
+  }
+  await removeOverlaysFromAllTabs();
+}
+
+async function sendOverlayMessage(tabId, message) {
+  try {
+    await chrome.tabs.sendMessage(tabId, message);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function injectOverlay(tabId, expired = false) {
+  const shown = await sendOverlayMessage(tabId, {
+    type: "SHOW_OVERLAY",
+    expired,
+  });
+  if (shown) return;
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content/overlay.js"],
+  });
+  await chrome.scripting.insertCSS({
+    target: { tabId },
+    files: ["content/overlay.css"],
+  });
+  await sendOverlayMessage(tabId, { type: "SHOW_OVERLAY", expired });
+}
+
+async function hideOverlay(tabId) {
+  await sendOverlayMessage(tabId, { type: "HIDE_OVERLAY" });
+}
+
+async function maybeOverlayTab(tabId, url, expired = false) {
+  if (!isInjectableUrl(url)) {
+    await hideOverlay(tabId);
+    return;
+  }
+
+  const state = await getOverlayState(url, tabId, expired);
+  if (state.show) {
+    await injectOverlay(tabId, expired);
+  } else {
+    await hideOverlay(tabId);
+  }
+}
+
+async function applyOverlaysToAllTabs(expiredTabId = null) {
+  const tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] });
+  for (const tab of tabs) {
+    if (!tab.id || !tab.url) continue;
+    await maybeOverlayTab(tab.id, tab.url, tab.id === expiredTabId);
+  }
+}
+
+async function removeOverlaysFromAllTabs() {
+  const tabs = await chrome.tabs.query({ url: ["http://*/*", "https://*/*"] });
+  for (const tab of tabs) {
+    if (tab.id) await sendOverlayMessage(tab.id, { type: "REMOVE_OVERLAY" });
+  }
 }
 
 async function ensureBlockingNotExpired() {
@@ -193,7 +172,7 @@ async function stopBlocking() {
   await chrome.alarms.clear(BLOCKING_TICK_ALARM);
   await chrome.alarms.clear(BLOCK_END_ALARM);
   await saveSettings({ blockingActive: false });
-  await clearAllDynamicRules();
+  await unregisterOverlayScript();
 }
 
 async function runSyncFromSettings() {
@@ -204,10 +183,11 @@ async function runSyncFromSettings() {
   }
 
   if (settings.blockingActive) {
-    await updateBlockRules(settings);
+    await registerOverlayScript();
+    await applyOverlaysToAllTabs();
     scheduleBlockingTick();
   } else {
-    await clearAllDynamicRules();
+    await unregisterOverlayScript();
   }
 }
 
@@ -224,7 +204,6 @@ async function endEmergencyForTab(tabId, recordMs = true) {
   if (!session) return;
 
   activeEmergencyTabs.delete(tabId);
-  await removeAllowRule(ALLOW_RULE_BASE + tabId);
 
   if (recordMs) {
     const elapsed = Math.min(Date.now() - session.startedAt, session.endsAt - session.startedAt);
@@ -241,8 +220,13 @@ async function grantEmergencyAccess(tabId, targetUrl) {
     return { ok: false, error: "No emergency time left today." };
   }
 
-  const host = extractHostname(targetUrl);
-  if (!host || !hostnameMatchesAnyPattern(host, settings.patterns)) {
+  const normalizedUrl = normalizeTargetUrl(targetUrl);
+  if (!normalizedUrl || !urlMatchesAnyPattern(normalizedUrl, settings.patterns)) {
+    return { ok: false, error: "URL is not on the block list." };
+  }
+
+  const host = extractHostname(normalizedUrl);
+  if (!host) {
     return { ok: false, error: "URL is not on the block list." };
   }
 
@@ -250,14 +234,11 @@ async function grantEmergencyAccess(tabId, targetUrl) {
     await endEmergencyForTab(tabId, false);
   }
 
-  const ruleId = ALLOW_RULE_BASE + tabId;
-  await addAllowRule(host, ruleId);
-
   const endsAt = Date.now() + remaining;
   activeEmergencyTabs.set(tabId, { host, startedAt: Date.now(), endsAt });
 
   scheduleBlockingTick();
-  await chrome.tabs.update(tabId, { url: targetUrl });
+  await hideOverlay(tabId);
 
   return { ok: true, remainingMs: remaining };
 }
@@ -268,20 +249,18 @@ async function tickEmergencySessions() {
     if (now >= session.endsAt) {
       const used = session.endsAt - session.startedAt;
       await recordEmergencyUsage(used);
-      await removeAllowRule(ALLOW_RULE_BASE + tabId);
       activeEmergencyTabs.delete(tabId);
 
-      const blockedPage = chrome.runtime.getURL(
-        `blocked/blocked.html?url=${encodeURIComponent(`https://${session.host}/`)}&expired=1`
-      );
       try {
-        await chrome.tabs.update(tabId, { url: blockedPage });
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.url) {
+          await maybeOverlayTab(tabId, tab.url, true);
+        }
       } catch {
         // Tab may have closed.
       }
     }
   }
-
 }
 
 async function onBlockingTick() {
@@ -293,10 +272,14 @@ async function onBlockingTick() {
   await tickEmergencySessions();
 }
 
+async function handleNavigation(tabId, url) {
+  const settings = await getSettings();
+  if (!settings.blockingActive || !isInjectableUrl(url)) return;
+  await maybeOverlayTab(tabId, url);
+}
+
 chrome.runtime.onInstalled.addListener(() => syncFromSettings());
 chrome.runtime.onStartup.addListener(() => syncFromSettings());
-
-// Service worker can wake at any time — always reconcile expired blocking.
 ensureBlockingNotExpired().then(syncFromSettings);
 
 chrome.storage.onChanged.addListener((changes, area) => {
@@ -318,18 +301,29 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (!activeEmergencyTabs.has(tabId)) return;
   if (changeInfo.url) {
-    const session = activeEmergencyTabs.get(tabId);
-    const host = extractHostname(changeInfo.url);
-    if (!host || host !== session.host) {
-      endEmergencyForTab(tabId);
+    if (activeEmergencyTabs.has(tabId)) {
+      const session = activeEmergencyTabs.get(tabId);
+      const host = extractHostname(changeInfo.url);
+      if (!host || host !== session.host) {
+        endEmergencyForTab(tabId);
+      }
     }
+    handleNavigation(tabId, changeInfo.url);
+  } else if (changeInfo.status === "complete" && tab.url) {
+    handleNavigation(tabId, tab.url);
   }
 });
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
+  if (details.frameId !== 0) return;
+  handleNavigation(details.tabId, details.url);
+});
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
+    const tabId = message.tabId ?? sender.tab?.id;
+
     switch (message.type) {
       case "GET_STATUS": {
         const settings = await ensureBlockingNotExpired();
@@ -338,6 +332,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           emergencyRemainingMs: getEmergencyRemainingMs(settings),
           activeEmergencyTabs: activeEmergencyTabs.size,
         });
+        break;
+      }
+      case "GET_OVERLAY_STATE": {
+        sendResponse(await getOverlayState(message.url, tabId, message.expired));
         break;
       }
       case "START_BLOCKING": {
@@ -369,14 +367,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
         syncPaused = true;
         try {
-          await replaceBlockRules(pendingSettings);
           await saveSettings(pendingSettings);
+          await registerOverlayScript();
+          await applyOverlaysToAllTabs();
           chrome.alarms.clear(BLOCK_END_ALARM);
           chrome.alarms.create(BLOCK_END_ALARM, { when: end });
           scheduleBlockingTick();
           sendResponse({ ok: true });
         } catch (err) {
-          await removeBlockRules();
+          await unregisterOverlayScript();
+          await saveSettings({ blockingActive: false });
           sendResponse({
             ok: false,
             error: err?.message || "Could not start blocking.",
@@ -398,7 +398,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         break;
       }
       case "GRANT_EMERGENCY": {
-        const tabId = message.tabId ?? _sender.tab?.id;
         const result = await grantEmergencyAccess(tabId, message.url);
         sendResponse(result);
         break;

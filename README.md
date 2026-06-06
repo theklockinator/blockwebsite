@@ -24,11 +24,12 @@ Block websites using wildcard hostname patterns (e.g. `*.google.*`), with daily 
 4. Choose **stop blocking at** date/time
 5. Click **Start blocking**
 
-When you visit a blocked site, you’ll see a block page. Use **Emergency access** to browse for your remaining daily allowance.
+When you visit a blocked site, an overlay covers the page (the real URL stays in the address bar and history). Use **Emergency access** to browse for your remaining daily allowance.
 
 ## Permissions
 
-- `declarativeNetRequest` — redirect blocked pages
+- `scripting` — inject block overlay on matched pages
+- `webNavigation` — catch SPA navigations
 - `storage` — save settings and daily emergency usage
 - `alarms` — auto-stop and emergency timers
 - `tabs` — emergency session tracking
