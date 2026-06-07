@@ -2,6 +2,7 @@
   const ROOT_ID = "blockwebsite-overlay-root";
 
   let countdownTimer = null;
+  let emergencyPollTimer = null;
   let blockEndTime = null;
   let scrollLockCleanup = null;
   let trapCleanup = null;
@@ -36,6 +37,13 @@
     if (countdownTimer) {
       clearInterval(countdownTimer);
       countdownTimer = null;
+    }
+  }
+
+  function stopEmergencyPoll() {
+    if (emergencyPollTimer) {
+      clearInterval(emergencyPollTimer);
+      emergencyPollTimer = null;
     }
   }
 
@@ -101,6 +109,7 @@
 
   function teardownInteractionLocks() {
     stopCountdown();
+    stopEmergencyPoll();
     trapCleanup?.();
     scrollLockCleanup?.();
   }
@@ -130,6 +139,26 @@
     stopCountdown();
     updateCountdownEl(valueEl, countdownWrap);
     countdownTimer = setInterval(() => updateCountdownEl(valueEl, countdownWrap), 1000);
+  }
+
+  function startEmergencyPoll(remainingEl, emergencyBtn) {
+    stopEmergencyPoll();
+
+    const update = async () => {
+      try {
+        const { remainingMs } = await chrome.runtime.sendMessage({
+          type: "GET_EMERGENCY_REMAINING",
+        });
+        const remaining = remainingMs ?? 0;
+        remainingEl.textContent = `${formatMsAsMmSs(remaining)} remaining today`;
+        emergencyBtn.disabled = remaining <= 0;
+      } catch {
+        // Extension context may be unavailable.
+      }
+    };
+
+    update();
+    emergencyPollTimer = setInterval(update, 1000);
   }
 
   function renderOverlay(state) {
@@ -178,6 +207,7 @@
 
     blockEndTime = state.blockEndTime;
     startCountdown(countdownValue, countdownWrap);
+    startEmergencyPoll(remainingEl, emergencyBtn);
 
     emergencyBtn.addEventListener("click", async () => {
       errorEl.hidden = true;
@@ -192,7 +222,14 @@
       if (!result?.ok) {
         errorEl.hidden = false;
         errorEl.textContent = result?.error || "Could not grant emergency access.";
-        emergencyBtn.disabled = state.emergencyRemainingMs <= 0;
+        try {
+          const { remainingMs } = await chrome.runtime.sendMessage({
+            type: "GET_EMERGENCY_REMAINING",
+          });
+          emergencyBtn.disabled = (remainingMs ?? 0) <= 0;
+        } catch {
+          emergencyBtn.disabled = false;
+        }
         emergencyBtn.focus();
         return;
       }

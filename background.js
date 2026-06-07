@@ -14,6 +14,11 @@ import {
 const OVERLAY_SCRIPT_ID = "blockwebsite-overlay";
 const BLOCKING_TICK_ALARM = "blocking-tick";
 const BLOCK_END_ALARM = "block-end";
+const EMERGENCY_ALARM_PREFIX = "emergency-tab-";
+
+function emergencyAlarmName(tabId) {
+  return `${EMERGENCY_ALARM_PREFIX}${tabId}`;
+}
 
 /** @type {Map<number, { host: string, startedAt: number, endsAt: number }>} */
 const activeEmergencyTabs = new Map();
@@ -35,7 +40,7 @@ async function getOverlayState(url, tabId, expired = false) {
 
   const base = {
     show: false,
-    emergencyRemainingMs: getEmergencyRemainingMs(settings),
+    emergencyRemainingMs: getEmergencyRemainingMs(settings, activeEmergencyTabs),
     blockEndTime: settings.blockEndTime,
     expired,
   };
@@ -168,6 +173,9 @@ async function scheduleBlockEndAlarm(blockEndTime) {
 }
 
 async function stopBlocking() {
+  for (const tabId of activeEmergencyTabs.keys()) {
+    await chrome.alarms.clear(emergencyAlarmName(tabId));
+  }
   activeEmergencyTabs.clear();
   await chrome.alarms.clear(BLOCKING_TICK_ALARM);
   await chrome.alarms.clear(BLOCK_END_ALARM);
@@ -204,6 +212,7 @@ async function endEmergencyForTab(tabId, recordMs = true) {
   if (!session) return;
 
   activeEmergencyTabs.delete(tabId);
+  await chrome.alarms.clear(emergencyAlarmName(tabId));
 
   if (recordMs) {
     const elapsed = Math.min(Date.now() - session.startedAt, session.endsAt - session.startedAt);
@@ -211,11 +220,35 @@ async function endEmergencyForTab(tabId, recordMs = true) {
   }
 }
 
+async function expireEmergencySession(tabId, expired = true) {
+  const session = activeEmergencyTabs.get(tabId);
+  if (!session) return;
+
+  const used = Math.min(Date.now() - session.startedAt, session.endsAt - session.startedAt);
+  activeEmergencyTabs.delete(tabId);
+  await chrome.alarms.clear(emergencyAlarmName(tabId));
+
+  if (used > 0) await recordEmergencyUsage(used);
+
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.url) {
+      await maybeOverlayTab(tabId, tab.url, expired);
+    }
+  } catch {
+    // Tab may have closed.
+  }
+}
+
+function scheduleEmergencyAlarm(tabId, endsAt) {
+  chrome.alarms.create(emergencyAlarmName(tabId), { when: endsAt });
+}
+
 async function grantEmergencyAccess(tabId, targetUrl) {
   const settings = await ensureBlockingNotExpired();
   if (!settings.blockingActive) return { ok: false, error: "Blocking is not active." };
 
-  const remaining = getEmergencyRemainingMs(settings);
+  const remaining = getEmergencyRemainingMs(settings, activeEmergencyTabs);
   if (remaining <= 0) {
     return { ok: false, error: "No emergency time left today." };
   }
@@ -237,6 +270,7 @@ async function grantEmergencyAccess(tabId, targetUrl) {
   const endsAt = Date.now() + remaining;
   activeEmergencyTabs.set(tabId, { host, startedAt: Date.now(), endsAt });
 
+  scheduleEmergencyAlarm(tabId, endsAt);
   scheduleBlockingTick();
   await hideOverlay(tabId);
 
@@ -245,20 +279,9 @@ async function grantEmergencyAccess(tabId, targetUrl) {
 
 async function tickEmergencySessions() {
   const now = Date.now();
-  for (const [tabId, session] of activeEmergencyTabs.entries()) {
+  for (const [tabId, session] of [...activeEmergencyTabs.entries()]) {
     if (now >= session.endsAt) {
-      const used = session.endsAt - session.startedAt;
-      await recordEmergencyUsage(used);
-      activeEmergencyTabs.delete(tabId);
-
-      try {
-        const tab = await chrome.tabs.get(tabId);
-        if (tab.url) {
-          await maybeOverlayTab(tabId, tab.url, true);
-        }
-      } catch {
-        // Tab may have closed.
-      }
+      await expireEmergencySession(tabId, true);
     }
   }
 }
@@ -291,6 +314,13 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     await stopBlocking();
     return;
   }
+  if (alarm.name.startsWith(EMERGENCY_ALARM_PREFIX)) {
+    const tabId = Number(alarm.name.slice(EMERGENCY_ALARM_PREFIX.length));
+    if (Number.isFinite(tabId)) {
+      await expireEmergencySession(tabId, true);
+    }
+    return;
+  }
   if (alarm.name === BLOCKING_TICK_ALARM) {
     await onBlockingTick();
   }
@@ -301,18 +331,20 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.url) {
-    if (activeEmergencyTabs.has(tabId)) {
-      const session = activeEmergencyTabs.get(tabId);
-      const host = extractHostname(changeInfo.url);
-      if (!host || host !== session.host) {
-        endEmergencyForTab(tabId);
+  (async () => {
+    if (changeInfo.url) {
+      if (activeEmergencyTabs.has(tabId)) {
+        const session = activeEmergencyTabs.get(tabId);
+        const host = extractHostname(changeInfo.url);
+        if (!host || host !== session.host) {
+          await endEmergencyForTab(tabId);
+        }
       }
+      await handleNavigation(tabId, changeInfo.url);
+    } else if (changeInfo.status === "complete" && tab.url) {
+      await handleNavigation(tabId, tab.url);
     }
-    handleNavigation(tabId, changeInfo.url);
-  } else if (changeInfo.status === "complete" && tab.url) {
-    handleNavigation(tabId, tab.url);
-  }
+  })();
 });
 
 chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
@@ -329,7 +361,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const settings = await ensureBlockingNotExpired();
         sendResponse({
           ...settings,
-          emergencyRemainingMs: getEmergencyRemainingMs(settings),
+          emergencyRemainingMs: getEmergencyRemainingMs(settings, activeEmergencyTabs),
           activeEmergencyTabs: activeEmergencyTabs.size,
         });
         break;
@@ -404,7 +436,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case "GET_EMERGENCY_REMAINING": {
         const settings = await ensureBlockingNotExpired();
-        sendResponse({ remainingMs: getEmergencyRemainingMs(settings) });
+        sendResponse({
+          remainingMs: getEmergencyRemainingMs(settings, activeEmergencyTabs),
+        });
         break;
       }
       default:
